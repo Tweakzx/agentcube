@@ -137,12 +137,20 @@ func main() {
 
 	// Wait for signal or error
 	select {
-	case <-sigCh:
-		klog.Info("Received shutdown signal, shutting down gracefully...")
+	case sig := <-sigCh:
+		klog.Infof("Received signal %v, initiating graceful shutdown...", sig)
 		cancel()
-		time.Sleep(2 * time.Second) // Give server time to shutdown gracefully
+		// Perform coordinated graceful shutdown
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			klog.Errorf("Graceful shutdown error: %v", err)
+		}
+		// Give controller manager time to shutdown
+		time.Sleep(2 * time.Second)
 	case err := <-errCh:
-		klog.Fatalf("Server error: %v", err)
+		klog.Errorf("Server error: %v", err)
+		cancel()
 	}
 
 	klog.Info("Server stopped")

@@ -40,6 +40,8 @@ type Server struct {
 	tokenCache        *TokenCache
 	informers         *Informers
 	storeClient       store.Store
+	gc                *garbageCollector
+	stopCh            chan struct{}
 }
 
 type Config struct {
@@ -83,6 +85,7 @@ func NewServer(config *Config, sandboxController *SandboxReconciler) (*Server, e
 		tokenCache:        tokenCache,
 		informers:         NewInformers(k8sClient),
 		storeClient:       store.Storage(),
+		stopCh:            make(chan struct{}),
 	}
 
 	// Setup routes
@@ -154,8 +157,8 @@ func (s *Server) Start(ctx context.Context) error {
 
 	klog.Infof("Server listening on %s", addr)
 
-	gc := newGarbageCollector(s.k8sClient, s.storeClient, 15*time.Second)
-	go gc.run(ctx.Done())
+	s.gc = newGarbageCollector(s.k8sClient, s.storeClient, 15*time.Second)
+	go s.gc.run(s.stopCh)
 
 	// Start HTTP or HTTPS server
 	if s.config.EnableTLS {
@@ -174,4 +177,49 @@ func (s *Server) loggingMiddleware(c *gin.Context) {
 	klog.Infof("%s %s %s", c.Request.Method, c.Request.RequestURI, c.ClientIP())
 	c.Next()
 	klog.Infof("%s %s - completed in %v", c.Request.Method, c.Request.RequestURI, time.Since(start))
+}
+
+// Shutdown gracefully shuts down the server and all its components.
+// The shutdown sequence is:
+// 1. Stop the HTTP server (stop accepting new requests)
+// 2. Signal background workers (garbage collector, informers) to stop
+// 3. Close the store connections (Redis/Valkey) to release resources
+func (s *Server) Shutdown(ctx context.Context) error {
+	klog.Info("Starting graceful shutdown...")
+
+	var errs []error
+
+	// Step 1: Stop HTTP server
+	if s.httpServer != nil {
+		klog.Info("Shutting down HTTP server...")
+		if err := s.httpServer.Shutdown(ctx); err != nil {
+			klog.Errorf("HTTP server shutdown error: %v", err)
+			errs = append(errs, fmt.Errorf("http server shutdown: %w", err))
+		} else {
+			klog.Info("HTTP server stopped successfully")
+		}
+	}
+
+	// Step 2: Stop background workers (GC and Informers)
+	klog.Info("Stopping background workers...")
+	close(s.stopCh)
+	klog.Info("Background workers stopped")
+
+	// Step 3: Close store connections
+	if s.storeClient != nil {
+		klog.Info("Closing store connections...")
+		if err := s.storeClient.Close(); err != nil {
+			klog.Errorf("Store close error: %v", err)
+			errs = append(errs, fmt.Errorf("store close: %w", err))
+		} else {
+			klog.Info("Store connections closed successfully")
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("shutdown completed with errors: %v", errs)
+	}
+
+	klog.Info("Graceful shutdown completed successfully")
+	return nil
 }

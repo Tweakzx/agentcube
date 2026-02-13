@@ -298,3 +298,9 @@ func (vs *valkeyStore) UpdateSessionLastActivity(ctx context.Context, sessionID 
 	}
 	return nil
 }
+
+// Close closes the valkey client connection
+func (vs *valkeyStore) Close() error {
+	vs.cli.Close()
+	return nil
+}

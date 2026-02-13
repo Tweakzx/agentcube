@@ -297,3 +297,8 @@ func (rs *redisStore) UpdateSessionLastActivity(ctx context.Context, sessionID s
 
 	return nil
 }
+
+// Close closes the redis client connection
+func (rs *redisStore) Close() error {
+	return rs.cli.Close()
+}
