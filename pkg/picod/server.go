@@ -92,6 +92,13 @@ func NewServer(config Config) *Server {
 	// Health check (no authentication required)
 	engine.GET("/health", s.HealthCheckHandler)
 
+	// Internal routes (for workload manager, requires auth)
+	internal := engine.Group("/internal")
+	internal.Use(s.authManager.AuthMiddleware())
+	{
+		internal.POST("/cleanup", s.CleanupHandler)
+	}
+
 	s.engine = engine
 	return s
 }

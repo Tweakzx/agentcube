@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/klog/v2"
@@ -86,6 +87,34 @@ func (s *Server) handleSandboxCreate(c *gin.Context, kind string) {
 		klog.Errorf("request body validation failed: %v", err)
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	// Try to get sandbox from hot pool first (reuse enabled)
+	if s.poolManager != nil && s.config.PoolConfig.ReuseEnabled {
+		pooledSandbox := s.poolManager.GetHotPoolSandbox(sandboxReq.Namespace, sandboxReq.Name, kind)
+		if pooledSandbox != nil {
+			// Generate new SessionID for reused sandbox
+			newSessionID := uuid.New().String()
+			pooledSandbox.SessionID = newSessionID
+
+			response := &types.CreateSandboxResponse{
+				SessionID:   newSessionID, // Use new SessionID
+				SandboxID:   pooledSandbox.SandboxID,
+				SandboxName: pooledSandbox.Name,
+				EntryPoints: make([]types.SandboxEntryPoint, len(pooledSandbox.EntryPoints)),
+			}
+			for i, ep := range pooledSandbox.EntryPoints {
+				response.EntryPoints[i] = types.SandboxEntryPoint{
+					Path:     ep.Path,
+					Protocol: ep.Protocol,
+					Endpoint: ep.Endpoint,
+				}
+			}
+			klog.Infof("Reused sandbox %s from hot pool for %s/%s (%s)",
+				pooledSandbox.SandboxID, sandboxReq.Namespace, sandboxReq.Name, kind)
+			respondJSON(c, http.StatusOK, response)
+			return
+		}
 	}
 
 	var sandbox *sandboxv1alpha1.Sandbox

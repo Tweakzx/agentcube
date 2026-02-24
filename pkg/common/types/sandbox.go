@@ -33,6 +33,12 @@ type SandboxInfo struct {
 	// LastActivityAt is intentionally omitted from this type.
 	// Last activity is tracked in Store via a sorted set index.
 	Status string `json:"status"`
+
+	// Reuse fields
+	InPool     bool   `json:"inPool"`
+	PoolLevel  string `json:"poolLevel,omitempty"`
+	ReuseCount int    `json:"reuseCount,omitempty"`
+	PodIP      string `json:"podIp,omitempty"`
 }
 
 type SandboxEntryPoint struct {

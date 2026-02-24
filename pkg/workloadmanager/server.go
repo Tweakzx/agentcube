@@ -40,6 +40,8 @@ type Server struct {
 	tokenCache        *TokenCache
 	informers         *Informers
 	storeClient       store.Store
+	poolManager       *PoolManager
+	poolAutoscaler    *PoolAutoscaler
 }
 
 type Config struct {
@@ -55,6 +57,8 @@ type Config struct {
 	TLSKey string
 	// EnableAuth enable auth by service account
 	EnableAuth bool
+	// PoolConfig for hot/warm pool management
+	PoolConfig PoolConfig
 }
 
 // NewServer creates a new API server instance
@@ -76,6 +80,21 @@ func NewServer(config *Config, sandboxController *SandboxReconciler) (*Server, e
 	// Create token cache (cache up to 1000 tokens, 5min TTL)
 	tokenCache := NewTokenCache(1000, 5*time.Minute)
 
+	// Create pool autoscaler with k8s client for actual CRD updates
+	var autoscaler *PoolAutoscaler
+	if config.PoolConfig.HotPoolEnabled || config.PoolConfig.WarmPoolEnabled {
+		autoscalerConfig := PoolAutoscalerConfig{
+			Enabled:       true,
+			CheckInterval: 5 * time.Minute,
+			MinSize:       int32(config.PoolConfig.HotPoolMinSize),
+			MaxSize:       int32(config.PoolConfig.HotPoolMaxSize),
+			ScaleStep:     5,
+		}
+		autoscaler = NewPoolAutoscaler(autoscalerConfig, nil, nil, k8sClient.dynamicClient)
+	}
+
+	poolManager := NewPoolManager(config.PoolConfig, nil)
+
 	server := &Server{
 		config:            config,
 		k8sClient:         k8sClient,
@@ -83,6 +102,8 @@ func NewServer(config *Config, sandboxController *SandboxReconciler) (*Server, e
 		tokenCache:        tokenCache,
 		informers:         NewInformers(k8sClient),
 		storeClient:       store.Storage(),
+		poolManager:       poolManager,
+		poolAutoscaler:    autoscaler,
 	}
 
 	// Setup routes
@@ -110,6 +131,9 @@ func (s *Server) setupRoutes() {
 	// code interpreter management endpoints
 	v1Group.POST("/code-interpreter", s.handleCodeInterpreterCreate)
 	v1Group.DELETE("/code-interpreter/sessions/:sessionId", s.handleDeleteSandbox)
+	// pool management endpoints
+	v1Group.GET("/pool/stats", s.handlePoolStats)
+	v1Group.POST("/pool/return/:sandboxId", s.handlePoolReturn)
 }
 
 // Start starts the API server
@@ -130,7 +154,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Create HTTP/2 server for better performance
 	h2s := &http2.Server{}
-	
+
 	// Wrap handler with h2c for HTTP/2 cleartext support
 	h2cHandler := h2c.NewHandler(s.router, h2s)
 
@@ -157,6 +181,12 @@ func (s *Server) Start(ctx context.Context) error {
 	gc := newGarbageCollector(s.k8sClient, s.storeClient, 15*time.Second)
 	go gc.run(ctx.Done())
 
+	// Start pool manager background tasks
+	if s.poolManager != nil && (s.config.PoolConfig.HotPoolEnabled || s.config.PoolConfig.ReuseEnabled) {
+		go s.poolManager.Run(ctx)
+		klog.Info("Pool manager started")
+	}
+
 	// Start HTTP or HTTPS server
 	if s.config.EnableTLS {
 		if s.config.TLSCert == "" || s.config.TLSKey == "" {
@@ -174,4 +204,64 @@ func (s *Server) loggingMiddleware(c *gin.Context) {
 	klog.Infof("%s %s %s", c.Request.Method, c.Request.RequestURI, c.ClientIP())
 	c.Next()
 	klog.Infof("%s %s - completed in %v", c.Request.Method, c.Request.RequestURI, time.Since(start))
+}
+
+// handlePoolStats returns pool statistics
+func (s *Server) handlePoolStats(c *gin.Context) {
+	if s.poolManager == nil {
+		respondJSON(c, http.StatusOK, gin.H{
+			"message": "pool manager not enabled",
+		})
+		return
+	}
+	stats := s.poolManager.GetStats()
+	respondJSON(c, http.StatusOK, stats)
+}
+
+// handlePoolReturn returns a sandbox to the pool for reuse
+func (s *Server) handlePoolReturn(c *gin.Context) {
+	sandboxID := c.Param("sandboxId")
+	if sandboxID == "" {
+		respondError(c, http.StatusBadRequest, "sandboxId is required")
+		return
+	}
+
+	if s.poolManager == nil {
+		respondError(c, http.StatusBadRequest, "pool manager not enabled")
+		return
+	}
+
+	sandbox, err := s.storeClient.GetSandboxBySessionID(c.Request.Context(), sandboxID)
+	if err != nil {
+		respondError(c, http.StatusNotFound, "sandbox not found")
+		return
+	}
+
+	pooledSandbox := &PooledSandbox{
+		SandboxID:   sandbox.SandboxID,
+		Name:        sandbox.Name,
+		Namespace:   sandbox.SandboxNamespace,
+		Kind:        sandbox.Kind,
+		EntryPoints: make([]SandboxEntryPoint, len(sandbox.EntryPoints)),
+		PodIP:       sandbox.PodIP,
+		ReuseCount:  sandbox.ReuseCount,
+	}
+	for i, ep := range sandbox.EntryPoints {
+		pooledSandbox.EntryPoints[i] = SandboxEntryPoint{
+			Path:     ep.Path,
+			Protocol: ep.Protocol,
+			Endpoint: ep.Endpoint,
+		}
+	}
+
+	if err := s.poolManager.ReturnToHotPool(pooledSandbox); err != nil {
+		respondError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondJSON(c, http.StatusOK, gin.H{
+		"message":    "sandbox returned to pool",
+		"sandboxId":  sandboxID,
+		"reuseCount": pooledSandbox.ReuseCount,
+	})
 }

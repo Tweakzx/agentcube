@@ -47,6 +47,11 @@ var (
 		Version:  "v1alpha1",
 		Resource: "sandboxclaims",
 	}
+	SandboxWarmPoolGVR = schema.GroupVersionResource{
+		Group:    "extensions.agents.x-k8s.io",
+		Version:  "v1alpha1",
+		Resource: "sandboxwarmpools",
+	}
 )
 
 type Informers struct {
